@@ -39,6 +39,11 @@ import {
   MAX_CACHED_INTERVALS as MAX_EDIT_CACHED_INTERVALS,
   MAX_EDITS,
 } from './cache-edit.js';
+import {
+  diffSnapshots,
+  MAX_FRAGMENTS as MAX_SNAPSHOT_FRAGMENTS,
+  MAX_FRAGMENT_BASE64_LENGTH as MAX_SNAPSHOT_FRAGMENT_BASE64_LENGTH,
+} from './snapshot-diff.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -266,6 +271,33 @@ const cacheEditBodySchema = {
   },
 };
 
+const snapshotFragmentSchema = {
+  type: 'object',
+  required: ['start', 'dataBase64'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    dataBase64: { type: 'string', minLength: 4, maxLength: MAX_SNAPSHOT_FRAGMENT_BASE64_LENGTH },
+  },
+};
+
+const snapshotFragmentsSchema = {
+  type: 'array',
+  maxItems: MAX_SNAPSHOT_FRAGMENTS,
+  items: snapshotFragmentSchema,
+};
+
+const snapshotDiffBodySchema = {
+  type: 'object',
+  required: ['size', 'before', 'after'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    before: snapshotFragmentsSchema,
+    after: snapshotFragmentsSchema,
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -479,6 +511,27 @@ export function buildApp(config = {}) {
         size: request.body.size,
         cached: request.body.cached,
         edits: request.body.edits,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Sparse-cache snapshot comparison: POST /snapshot-diff with the resource
+  // size and the two fragment groups (before/after the update), each using
+  // the same {start, dataBase64} shape as /assemble-response. The two groups
+  // together may decode to at most 1 MiB. No Range header involved.
+  app.post(
+    '/snapshot-diff',
+    {
+      schema: { body: snapshotDiffBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = diffSnapshots({
+        size: request.body.size,
+        before: request.body.before,
+        after: request.body.after,
       });
 
       return reply.status(result.statusCode).send(result);

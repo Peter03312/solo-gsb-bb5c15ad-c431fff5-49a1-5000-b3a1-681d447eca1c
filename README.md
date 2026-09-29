@@ -42,6 +42,12 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 插入即缺口，仅旧/新两侧均相邻的映射才合并），以及新资源升序归并后的
 缺口区间（见下文）。
 
+`POST /snapshot-diff` 面向**更新前后两份稀疏快照的按字节比对**：上报资源
+大小与前、后两组片段（沿用 `{start, dataBase64}` 格式，两组合计 ≤ 1 MiB），
+各自组合并重叠片段（重叠字节不一致即指出所属快照并拒绝比较），仅在两边
+都有字节的位置判定 `same` / `changed`，任一边缺失标记 `unknown`，输出按
+偏移排序、同类相邻合并的闭区间与各类字节数（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -780,6 +786,87 @@ curl -X POST http://localhost:3000/cache-edit-plan \
 `EDIT_RANGE_OUT_OF_BOUNDS`、`EMPTY_EDIT`、`DUPLICATE_EDIT_START`、
 `EDITS_OVERLAP`、`NEW_SIZE_OVERFLOW`。
 
+### `POST /snapshot-diff`（更新前后稀疏缓存快照按字节比对）
+
+同一资源更新前后各有一份**稀疏缓存快照**，需要按绝对偏移逐字节定位差异。
+本接口输入资源大小 `size` 与前、后两组片段 `before` / `after`，片段沿用
+`/assemble-response` 的 `{"start":…,"dataBase64":…}` 格式（标准 base64、
+规范 `=` 填充、完整落在资源边界内），**两组片段解码后合计 ≤ 1 MiB**。全部
+参数在 JSON 体内，不涉及 `Range` 请求头。
+
+请求体：
+
+| 字段     | 类型    | 必填 | 说明                                                         |
+| -------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`   | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `before` | array   | 是   | 更新前片段数组（≤ 1024 项），每项 `{"start":…,"dataBase64":…}`，规则同 `/assemble-response` 的 `fragments` |
+| `after`  | array   | 是   | 更新后片段数组（≤ 1024 项），格式同 `before`                 |
+
+处理规则：
+
+1. **组内合并**：各组先按偏移合并重叠/相邻片段；重叠位置的字节必须一致，
+   否则该快照自相矛盾，返回 `409 FRAGMENT_CONFLICT`，响应中的 `snapshot`
+   指出所属快照（`"before"` / `"after"`），`intervals` 给出归并后的冲突闭
+   区间，**拒绝比较**（不产生任何比对结果）。
+2. **三类判定**（仅按绝对偏移，不做任何对齐/平移）：
+   - `same`：前、后两份快照在该偏移**都有字节**且字节相同；
+   - `changed`：两边**都有字节**但字节不同；
+   - `unknown`：**任一边缺失**该偏移（只在一边有或两边都没有）。
+3. **区间输出**：三类闭区间按 `start` 升序排列，相邻且**同类**的区间合并；
+   类别交界处即使偏移相邻也不合并。`intervals` 覆盖**整个资源**，恒有
+   `sameBytes + changedBytes + unknownBytes === size`；空资源（`size: 0`）
+   返回空区间与三个 0 计数。
+4. **大资源安全**：覆盖几何全部按区间运算，只真正读取两边都持有的字节
+   （≤ 1 MiB）；长度求和经 BigInt，`size` 取到
+   `Number.MAX_SAFE_INTEGER` 时计数仍准确。
+
+响应（`200`）字段：
+
+| 字段           | 说明                                                         |
+| -------------- | ------------------------------------------------------------ |
+| `size`         | 资源字节数（即请求的 `size`）                                 |
+| `intervals`    | 闭区间数组，每项 `{"start":…,"end":…,"classification":"same"｜"changed"｜"unknown"}`，升序、同类相邻已合并、互不相交 |
+| `sameBytes`    | 两边均有且字节相同的字节数                                    |
+| `changedBytes` | 两边均有但字节不同的字节数                                    |
+| `unknownBytes` | 至少一边缺失的字节数                                          |
+
+示例：12 字节资源；前快照持有 `[0,11]` 的 `abcdefghijkl`，后快照持有
+`[2,8]` 的 `CXXghij` 与 `[10,11]` 的 `ls`。`[0,1]` 与 `[9]` 后快照缺失
+为 `unknown`；`[2,8]`、`[10,11]` 两边都有但字节全部不同为 `changed`：
+
+```bash
+curl -X POST http://localhost:3000/snapshot-diff \
+  -H 'Content-Type: application/json' \
+  -d '{"size":12,
+       "before":[{"start":0,"dataBase64":"YWJjZGVmZ2hpamts"}],
+       "after":[{"start":2,"dataBase64":"Q1hYZ2hpag=="},{"start":10,"dataBase64":"bHM="}]}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "size": 12,
+  "intervals": [
+    { "start": 0, "end": 1, "classification": "unknown" },
+    { "start": 2, "end": 8, "classification": "changed" },
+    { "start": 9, "end": 9, "classification": "unknown" },
+    { "start": 10, "end": 11, "classification": "changed" }
+  ],
+  "sameBytes": 0,
+  "changedBytes": 9,
+  "unknownBytes": 3
+}
+```
+
+错误码包括：`INVALID_SIZE`（直接调用模块时）、`INVALID_FRAGMENTS`、
+`TOO_MANY_FRAGMENTS`、`INVALID_FRAGMENT`、`INVALID_FRAGMENT_BASE64`、
+`FRAGMENT_OUT_OF_BOUNDS`、`FRAGMENTS_TOO_LARGE`（两组合计超 1 MiB）以及
+`409 FRAGMENT_CONFLICT`；片段级错误与冲突响应都带 `snapshot` 字段说明属于
+`before` 还是 `after`。JSON 体使用与 `/assemble-response` 相同的严格校验
+（关闭类型强转与多余字段剔除，字符串数字、小数、多余字段一律 `400`）。
+
 服务默认监听本机 **3000 端口**（`http://localhost:3000`），用
 `docker compose up --build -d` 一条命令即可启动（见上文"单条启动命令"）。
 
@@ -909,7 +996,8 @@ src/
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
   shared-fetch.js   # 共享回源规划：多客户端需求全局归并去重、按上限拆块、带空隙阈值的自左向右合并、逐客户端覆盖核算
   cache-edit.js     # 编辑后缓存复用规划：编辑校验与排序、缓存去重、编辑边界分裂、净位移映射、旧/新双相邻合并、缺口补集（BigInt 求和）
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、/healthz、输入校验
+  snapshot-diff.js  # 更新前后稀疏快照比对：两组片段解码/边界/1 MiB 合计限额、组内重叠冲突拒绝、双覆盖逐字节 same/changed 分类、缺失补集 unknown、同类相邻合并（BigInt 计数）
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、POST /snapshot-diff、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -922,13 +1010,14 @@ test/
   cache-retention.test.js # 缓存保留规划用例（29 个）
   shared-fetch.test.js  # 共享回源规划用例（34 个）
   cache-edit.test.js    # 编辑后缓存复用规划用例（33 个）
+  snapshot-diff.test.js # 更新前后稀疏快照比对用例（21 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 244 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划
+npm test          # 298 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划 + 编辑后缓存复用 + 更新前后快照比对
 npm start
 ```
 
@@ -980,3 +1069,11 @@ npm start
   非空字符串且不得重复（空、纯空白、重复均 `400`），`clients` 上限 1000 项、
   单客户端区间与全部客户端区间合计均上限 10000 项，防止超大输入耗尽资源；
   所有偏移与字节核算全程在安全整数范围内，回源总长度不会超过资源大小。
+- `/snapshot-diff` 同样使用严格校验器：`before` / `after` 各上限 1024 项，
+  每项的 `start` 必须是非负安全整数、`dataBase64` 必须是规范标准 base64，
+  多余字段一律 `400`；片段必须完整落在资源内，**两组解码后合计不超过
+  1 MiB**（超出返回带 `snapshot` 的 `400 FRAGMENTS_TOO_LARGE`）；组内重叠
+  字节不一致时返回带 `snapshot`（`before`/`after`）的
+  `409 FRAGMENT_CONFLICT` 并拒绝比较；比对只读取两边都持有的字节，区间几何
+  与 BigInt 计数保证 `size` 接近 `Number.MAX_SAFE_INTEGER` 时不逐字节展开、
+  不丢精度。
