@@ -42,6 +42,14 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 插入即缺口，仅旧/新两侧均相邻的映射才合并），以及新资源升序归并后的
 缺口区间（见下文）。
 
+`POST /cache-snapshot-diff` 面向**同一资源更新前后的两份稀疏缓存快照**：
+上报资源大小与前（`before`）、后（`after`）两组 `{start, dataBase64}`
+片段（结构与 `/assemble-response` 完全相同），服务分别合并组内重叠片段
+（重叠处字节不一致时点名所属快照并拒绝比较），再把两份缓存叠加到整个
+资源上：仅在**两边均有字节**的位置判定 `equal` / `changed`，任一边缺失
+即标记 `unknown`；输出按偏移排序、同类相邻合并的闭区间及各类字节数
+（三类计数恒等于资源大小，见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -780,6 +788,106 @@ curl -X POST http://localhost:3000/cache-edit-plan \
 `EDIT_RANGE_OUT_OF_BOUNDS`、`EMPTY_EDIT`、`DUPLICATE_EDIT_START`、
 `EDITS_OVERLAP`、`NEW_SIZE_OVERFLOW`。
 
+### `POST /cache-snapshot-diff`（稀疏缓存快照差异定位）
+
+同一资源更新前后各有一份**稀疏缓存快照**时，本接口按字节定位两份快照
+之间的异同。输入资源大小与前、后两组片段（沿用
+`/assemble-response` 的 `{start, dataBase64}` 结构、规范 base64 和
+资源边界校验），服务先**分别合并**组内重叠片段，再把两份合并后的缓存
+叠加到整个资源上逐字节分类。全部参数在 JSON 体内，不涉及 `Range`
+请求头。
+
+请求体：
+
+| 字段       | 类型    | 必填 | 说明                                                         |
+| ---------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`     | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `before`   | array   | 是   | 更新**前**的缓存片段数组（≤ 1024 项），每项 `{"start":…,"dataBase64":…}`，结构与校验规则同 `/assemble-response` |
+| `after`    | array   | 是   | 更新**后**的缓存片段数组（≤ 1024 项），结构同 `before`        |
+
+片段规则与 `/assemble-response` 一致：`start` 为非负安全整数；
+`dataBase64` 为规范标准 base64（规范 `=` 填充、解码后 ≥ 1 字节）；片段
+必须**完整落在资源内**（`start + 字节数 ≤ size`）。两组片段**合计解码
+不得超过 1 MiB**（`400 FRAGMENTS_TOO_LARGE`，按 before、after 顺序累计
+判定）。
+
+处理规则：
+
+1. **组内合并**：两组片段各自按偏移合并（相邻自动拼接）。组内重叠位置
+   的字节必须一致；不一致则该快照自身不可信，返回
+   `409 FRAGMENT_CONFLICT`，`snapshot` 指出所属快照（`"before"` /
+   `"after"`，两组同时冲突时先报 `before`），`conflicts` 给出归并后的
+   冲突闭区间（相邻差异合并为一段），**拒绝比较**。
+2. **逐位置分类**（覆盖整个资源 `[0, size-1]`）：
+   - `equal`：前、后两份快照都覆盖该位置且字节相同；
+   - `changed`：前、后两份快照都覆盖该位置但字节不同；
+   - `unknown`：任一份快照未覆盖该位置（只缓存了一边或两边都没缓存），
+     无法判定异同。
+3. **区间归并输出**：分类结果按偏移排序，相邻且同类的位置合并为一个
+   闭区间；所有区间首尾相接，恰好覆盖整个资源。
+
+响应（`200`）字段：
+
+| 字段             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| `resource.size`  | 资源字节数（即请求的 `size`）                                 |
+| `ranges`         | 闭区间数组（按 `start` 升序、互不相交且首尾相接），每项 `{"start":…,"end":…,"kind":…}`，`kind` 为 `"equal"` / `"changed"` / `"unknown"` |
+| `counts`         | `{"equalBytes":…,"changedBytes":…,"unknownBytes":…}`，各类字节数；三者之和**恒等于 `size`**，即覆盖整个资源 |
+
+空资源（`size: 0`）要求两组片段均为空，返回空 `ranges` 与全 0 的
+`counts`。计数在内部以 BigInt 累加，在安全整数边界
+（`Number.MAX_SAFE_INTEGER`）仍精确。
+
+示例（10 字节资源：前快照覆盖 `[0,7]`（全 `a`），后快照覆盖 `[4,9]`
+（`aaabbb`）；重叠区 `[4,7]` 中 `[4,6]` 字节相同、字节 7 不同；
+`[0,3]` 与 `[8,9]` 只在一侧有缓存 → unknown）：
+
+```bash
+curl -s -X POST http://localhost:3000/cache-snapshot-diff \
+  -H 'Content-Type: application/json' \
+  -d '{"size":10,
+       "before":[{"start":0,"dataBase64":"YWFhYWFhYWE="}],
+       "after":[{"start":4,"dataBase64":"YWFhYmJi"}]}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "resource": { "size": 10 },
+  "ranges": [
+    { "start": 0, "end": 3, "kind": "unknown" },
+    { "start": 4, "end": 6, "kind": "equal" },
+    { "start": 7, "end": 7, "kind": "changed" },
+    { "start": 8, "end": 9, "kind": "unknown" }
+  ],
+  "counts": { "equalBytes": 3, "changedBytes": 1, "unknownBytes": 6 }
+}
+```
+
+组内重叠片段字节不一致的例子（`before` 两片在 `[4,5]` 不一致 →
+409，点名 `before`，不做任何比较）：
+
+```bash
+curl -s -i -X POST http://localhost:3000/cache-snapshot-diff \
+  -H 'Content-Type: application/json' \
+  -d '{"size":10,
+       "before":[{"start":0,"dataBase64":"YWFhYWFh"},{"start":4,"dataBase64":"Wlg="}],
+       "after":[{"start":0,"dataBase64":"YWFhYWFh"}]}'
+# HTTP/1.1 409 Conflict
+# {"statusCode":409,"code":"FRAGMENT_CONFLICT","error":"Conflict",
+#  "message":"before fragments carry different bytes in 1 interval",
+#  "snapshot":"before","conflicts":[{"start":4,"end":5}]}
+```
+
+两边都没有任何片段时整个资源都是 `unknown`（区间合并为
+`[0, size-1]`）。非法输入返回 `400`，错误码包括：`INVALID_SIZE`、
+`INVALID_FRAGMENTS`、`TOO_MANY_FRAGMENTS`、`INVALID_FRAGMENT`、
+`INVALID_FRAGMENT_BASE64`、`FRAGMENT_OUT_OF_BOUNDS`、
+`FRAGMENTS_TOO_LARGE`（错误信息中以 `before[i]` / `after[i]` 标明
+所属组与下标）；多余字段同样 `400`（严格校验器，不做类型强转）。
+
 服务默认监听本机 **3000 端口**（`http://localhost:3000`），用
 `docker compose up --build -d` 一条命令即可启动（见上文"单条启动命令"）。
 
@@ -909,7 +1017,8 @@ src/
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
   shared-fetch.js   # 共享回源规划：多客户端需求全局归并去重、按上限拆块、带空隙阈值的自左向右合并、逐客户端覆盖核算
   cache-edit.js     # 编辑后缓存复用规划：编辑校验与排序、缓存去重、编辑边界分裂、净位移映射、旧/新双相邻合并、缺口补集（BigInt 求和）
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、/healthz、输入校验
+  cache-diff.js     # 两份稀疏快照按字节定位差异：组内片段合并/冲突点名、边界切分叠加、equal/changed/unknown 分类与同类相邻合并（BigInt 计数）
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、POST /cache-snapshot-diff、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -922,13 +1031,14 @@ test/
   cache-retention.test.js # 缓存保留规划用例（29 个）
   shared-fetch.test.js  # 共享回源规划用例（34 个）
   cache-edit.test.js    # 编辑后缓存复用规划用例（33 个）
+  cache-diff.test.js    # 稀疏快照差异定位用例（22 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 244 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划
+npm test          # 299 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划 + 编辑后缓存复用规划 + 稀疏快照差异定位
 npm start
 ```
 
@@ -980,3 +1090,13 @@ npm start
   非空字符串且不得重复（空、纯空白、重复均 `400`），`clients` 上限 1000 项、
   单客户端区间与全部客户端区间合计均上限 10000 项，防止超大输入耗尽资源；
   所有偏移与字节核算全程在安全整数范围内，回源总长度不会超过资源大小。
+- `/cache-snapshot-diff` 同样使用严格校验器：`before` / `after` 各上限
+  1024 项，每项沿用 `/assemble-response` 的全部片段校验（非负安全整数
+  `start`、规范标准 base64、完整落在资源内），多余字段一律 `400`；两组
+  片段**合计解码不超过 1 MiB**（超出 `400 FRAGMENTS_TOO_LARGE`），因此
+  实际逐字节比对的重叠区也不超过 1 MiB；区间运算不逐字节展开整个资源
+  （仅在两份缓存的并集边界处切分），资源本身可大至
+  `Number.MAX_SAFE_INTEGER`；区间长度与各类字节数在内部以 BigInt 累加，
+  输出转回安全整数，安全整数边界仍精确。组内重叠片段字节不一致时直接
+  `409 FRAGMENT_CONFLICT` 并在 `snapshot` 中点名 `before` / `after`，
+  不会在快照自身不可信时给出任何比较结论。

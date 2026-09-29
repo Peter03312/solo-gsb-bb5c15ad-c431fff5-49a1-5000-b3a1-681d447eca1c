@@ -39,6 +39,10 @@ import {
   MAX_CACHED_INTERVALS as MAX_EDIT_CACHED_INTERVALS,
   MAX_EDITS,
 } from './cache-edit.js';
+import {
+  diffSnapshots,
+  MAX_FRAGMENTS as MAX_DIFF_FRAGMENTS,
+} from './cache-diff.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -266,6 +270,25 @@ const cacheEditBodySchema = {
   },
 };
 
+const cacheDiffBodySchema = {
+  type: 'object',
+  required: ['size', 'before', 'after'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    before: {
+      type: 'array',
+      maxItems: MAX_DIFF_FRAGMENTS,
+      items: fragmentSchema,
+    },
+    after: {
+      type: 'array',
+      maxItems: MAX_DIFF_FRAGMENTS,
+      items: fragmentSchema,
+    },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -479,6 +502,27 @@ export function buildApp(config = {}) {
         size: request.body.size,
         cached: request.body.cached,
         edits: request.body.edits,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Byte-level diff of two sparse snapshots of the same resource:
+  // POST /cache-snapshot-diff with the resource size and before/after fragment
+  // lists (same {start, dataBase64} shape as /assemble-response). No Range
+  // header involved.
+  app.post(
+    '/cache-snapshot-diff',
+    {
+      schema: { body: cacheDiffBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = diffSnapshots({
+        size: request.body.size,
+        before: request.body.before,
+        after: request.body.after,
       });
 
       return reply.status(result.statusCode).send(result);
